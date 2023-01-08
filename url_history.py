@@ -1,8 +1,12 @@
+"""Simple HTTP get wrapper that stores the history of fetched urls."""
+
 import requests
 import sqlite3
 import lzma
 import hashlib
 import datetime
+
+__version__ = "0.0.1"
 
 class HistorySession:
 
@@ -29,6 +33,7 @@ class HistorySession:
             else:
                 content_xz = lzma.compress(content)
                 cur.execute("INSERT INTO pages (url, sha256, content_xz, first_fetch, last_fetch) VALUES (?, ?, ?, ?, ?)", (url, sha256, content_xz, now, now))
+            self.db.commit()
             return content
         return lzma.decompress(past_fetch[1])
 
