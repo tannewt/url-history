@@ -28,23 +28,34 @@ class HistorySession:
     def __init__(self, filename="requests-history.db"):
         self.db = sqlite3.connect(filename)
 
+        self.already_refetched = set()
+
         cur = self.db.cursor()
         try:
             cur.execute("CREATE TABLE pages (url text, sha256 blob, content_xz blob, first_fetch timestamp, last_fetch timestamp)")
         except sqlite3.OperationalError:
             pass
 
+        cur.execute("PRAGMA user_version;")
+        db_version = cur.fetchone()[0]
+        if db_version < 1:
+            cur.execute("ALTER TABLE pages ADD COLUMN last_modified timestamp")
+            cur.execute("PRAGMA user_version = 1;")
+            self.db.commit()
+
         self.requests = requests.Session()
         retry_policy = urllib3.Retry(total=10, backoff_factor=0.1)
         a = requests.adapters.HTTPAdapter(max_retries=retry_policy)
         self.requests.mount('https://', a)
 
-    def get(self, url, fetch_again=False, crawl_delay=0, only_after=None):
+    def get(self, url, fetch_again=False, index=-1, crawl_delay=0, only_after=None):
         now = datetime.datetime.now()
         cur = self.db.cursor()
-        cur.execute("SELECT sha256, content_xz, first_fetch, last_fetch FROM pages WHERE url = ? ORDER BY last_fetch DESC LIMIT 1", (url,))
-        past_fetch = cur.fetchone()
-        if past_fetch is None or fetch_again:
+        cur.execute("SELECT sha256, content_xz, first_fetch, last_fetch FROM pages WHERE url = ? ORDER BY last_fetch ASC", (url,))
+        past_fetch = cur.fetchall()
+        if index < -1 and len(past_fetch) > 0 and -index > len(past_fetch):
+            return None
+        if not past_fetch or (fetch_again and url not in self.already_refetched):
             if only_after:
                 headers["If-Modified-Since"] = only_after.strftime("%a, %d %b %Y %H:%M:%S GMT")
             elif "If-Modified-Since" in headers:
@@ -55,19 +66,28 @@ class HistorySession:
             diff = after - before
             if diff > 1:
                 print("Slow request:", diff)
+            response = requests.get(url)
+            self.already_refetched.add(url)
             if response.status_code == 304:
+                return None
+            # Hide failing requests if we have an older version
+            if not response.ok:
+                if past_fetch:
+                    return lzma.decompress(past_fetch[index][1])
                 return None
             content = response.content
             sha256 = hashlib.sha256(content).digest()
-            if past_fetch and sha256 == past_fetch[0]:
-                cur.execute("UPDATE pages SET last_fetch = ? WHERE url = ? AND last_fetch = ?", (now, url, past_fetch[3]))
+            last_modified = response.headers.get("Last-Modified", None)
+            if past_fetch and sha256 == past_fetch[-1][0]:
+                cur.execute("UPDATE pages SET last_fetch = ? WHERE url = ? AND last_fetch = ?", (now, url, past_fetch[-1][3]))
+                cur.execute("UPDATE pages SET last_modified = ? WHERE url = ? AND last_fetch = ? AND last_modified IS NULL", (last_modified, url, past_fetch[-1][3]))
             else:
                 content_xz = lzma.compress(content)
-                cur.execute("INSERT INTO pages (url, sha256, content_xz, first_fetch, last_fetch) VALUES (?, ?, ?, ?, ?)", (url, sha256, content_xz, now, now))
+                cur.execute("INSERT INTO pages (url, sha256, content_xz, last_modified, first_fetch, last_fetch) VALUES (?, ?, ?, ?, ?, ?)", (url, sha256, content_xz, last_modified, now, now))
             self.db.commit()
             time.sleep(crawl_delay)
             return content
-        return lzma.decompress(past_fetch[1])
+        return lzma.decompress(past_fetch[index][1])
 
 if __name__ == "__main__":
     session = HistorySession()
